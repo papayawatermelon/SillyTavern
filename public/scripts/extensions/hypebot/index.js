@@ -62,11 +62,11 @@ const generateDebounced = debounce(() => generateHypeBot(), 500);
  * @param {string} text Text to set
  */
 function setHypeBotText(text) {
-    const chatBlock = $('#chat');
-    const originalScrollBottom = chatBlock[0].scrollHeight - (chatBlock.scrollTop() + chatBlock.outerHeight());
+    const blockA = $('#chat');
+    var originalScrollBottom = blockA[0].scrollHeight - (blockA.scrollTop() + blockA.outerHeight());
     hypeBotBar.html(DOMPurify.sanitize(text));
-    const newScrollTop = chatBlock[0].scrollHeight - (chatBlock.outerHeight() + originalScrollBottom);
-    chatBlock.scrollTop(newScrollTop);
+    var newScrollTop = blockA[0].scrollHeight - (blockA.outerHeight() + originalScrollBottom);
+    blockA.scrollTop(newScrollTop);
 }
 
 /**
@@ -191,13 +191,11 @@ jQuery(() => {
         settings.enabled = $('#hypebot_enabled').prop('checked');
         hypeBotBar.toggle(settings.enabled);
         abortController?.abort();
-        Object.assign(extension_settings.hypebot, settings);
         saveSettingsDebounced();
     });
 
     $('#hypebot_name').val(settings.name).on('input', () => {
         settings.name = String($('#hypebot_name').val());
-        Object.assign(extension_settings.hypebot, settings);
         saveSettingsDebounced();
     });
 

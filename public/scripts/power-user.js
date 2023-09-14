@@ -40,6 +40,7 @@ export {
     sortEntitiesList,
     fixMarkdown,
     power_user,
+    pygmalion_options,
     send_on_enter_options,
 };
 
@@ -66,6 +67,12 @@ export const chat_styles = {
     DOCUMENT: 2,
 }
 
+const pygmalion_options = {
+    DISABLED: -1,
+    AUTO: 0,
+    ENABLED: 1,
+}
+
 const send_on_enter_options = {
     DISABLED: -1,
     AUTO: 0,
@@ -86,6 +93,7 @@ let power_user = {
     tokenizer: tokenizers.BEST_MATCH,
     token_padding: 64,
     collapse_newlines: false,
+    pygmalion_formatting: pygmalion_options.AUTO,
     pin_examples: false,
     strip_examples: false,
     trim_sentences: false,
@@ -201,7 +209,6 @@ let power_user = {
     fuzzy_search: false,
     encode_tags: false,
     lazy_load: 0,
-    servers: [],
 };
 
 let themes = [];
@@ -810,6 +817,7 @@ function loadPowerUserSettings(settings, data) {
     $('#auto_fix_generated_markdown').prop("checked", power_user.auto_fix_generated_markdown);
     $('#auto_scroll_chat_to_bottom').prop("checked", power_user.auto_scroll_chat_to_bottom);
     $(`#tokenizer option[value="${power_user.tokenizer}"]`).attr('selected', true);
+    $(`#pygmalion_formatting option[value=${power_user.pygmalion_formatting}]`).attr("selected", true);
     $(`#send_on_enter option[value=${power_user.send_on_enter}]`).attr("selected", true);
     $("#import_card_tags").prop("checked", power_user.import_card_tags);
     $("#confirm_message_delete").prop("checked", power_user.confirm_message_delete !== undefined ? !!power_user.confirm_message_delete : true);
@@ -1153,15 +1161,15 @@ const compareFunc = (first, second) => {
         return Math.random() > 0.5 ? 1 : -1;
     }
 
-    const a = first[power_user.sort_field];
-    const b = second[power_user.sort_field];
-
-    if (power_user.sort_field === 'create_date') {
-        return sortMoments(timestampToMoment(b), timestampToMoment(a));
-    }
-
     switch (power_user.sort_rule) {
         case 'boolean':
+            const a = first[power_user.sort_field];
+            const b = second[power_user.sort_field];
+
+            if (power_user.sort_field === 'create_date') {
+                return sortMoments(timestampToMoment(a), timestampToMoment(b));
+            }
+
             if (a === true || a === 'true') return 1;  // Prioritize 'true' or true
             if (b === true || b === 'true') return -1; // Prioritize 'true' or true
             if (a && !b) return -1;        // Move truthy values to the end
@@ -1169,9 +1177,9 @@ const compareFunc = (first, second) => {
             if (a === b) return 0;         // Sort equal values normally
             return a < b ? -1 : 1;         // Sort non-boolean values normally
         default:
-            return typeof a == "string"
-                ? a.localeCompare(b)
-                : a - b;
+            return typeof first[power_user.sort_field] == "string"
+                ? first[power_user.sort_field].localeCompare(second[power_user.sort_field])
+                : first[power_user.sort_field] - second[power_user.sort_field];
     }
 };
 
@@ -1728,6 +1736,12 @@ $(document).ready(() => {
     // Settings that go to settings.json
     $("#collapse-newlines-checkbox").change(function () {
         power_user.collapse_newlines = !!$(this).prop("checked");
+        saveSettingsDebounced();
+    });
+
+    $("#pygmalion_formatting").change(function (e) {
+        power_user.pygmalion_formatting = Number($(this).find(":selected").val());
+        getStatus();
         saveSettingsDebounced();
     });
 

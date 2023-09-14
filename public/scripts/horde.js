@@ -107,7 +107,7 @@ async function generateHorde(prompt, params, signal) {
         "models": horde_settings.models,
     };
 
-    const response = await fetch("/api/horde/generate-text", {
+    const response = await fetch("/generate_horde", {
         method: 'POST',
         headers: {
             ...getRequestHeaders(),
@@ -210,7 +210,7 @@ function loadHordeSettings(settings) {
 }
 
 async function showKudos() {
-    const response = await fetch('/api/horde/user-info', {
+    const response = await fetch('/horde_userinfo', {
         method: 'POST',
         headers: getRequestHeaders(),
     });
@@ -256,7 +256,7 @@ jQuery(function () {
     })
 
     $("#horde_api_key").on("input", async function () {
-        const key = String($(this).val()).trim();
+        const key = $(this).val().trim();
         await writeSecret(SECRET_KEYS.HORDE, key);
     });
 

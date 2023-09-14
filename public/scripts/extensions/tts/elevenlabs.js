@@ -74,7 +74,7 @@ class ElevenLabsTtsProvider {
         $('#elevenlabs_tts_settings').on('input',this.onSettingsChange)
 
         await this.checkReady()
-        console.debug("ElevenLabs: Settings loaded")
+        console.info("Settings loaded")
     }
 
     // Perform a simple readiness check by trying to fetch voiceIds

@@ -153,8 +153,6 @@ const extension_settings = {
     },
     speech_recognition: {},
     rvc: {},
-    hypebot: {},
-    vectors: {},
 };
 
 let modules = [];

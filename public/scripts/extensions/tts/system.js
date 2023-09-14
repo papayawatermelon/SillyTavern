@@ -151,7 +151,7 @@ class SystemTtsProvider {
 
         $('#system_tts_pitch_output').text(this.settings.pitch);
         $('#system_tts_rate_output').text(this.settings.rate);
-        console.debug("SystemTTS: Settings loaded");
+        console.info("Settings loaded");
     }
 
     // Perform a simple readiness check by trying to fetch voiceIds
