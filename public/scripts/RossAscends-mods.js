@@ -31,7 +31,7 @@ import {
     SECRET_KEYS,
     secret_state,
 } from "./secrets.js";
-import { debounce, delay, getStringHash, waitUntilCondition } from "./utils.js";
+import { debounce, delay, getStringHash, isUrlOrAPIKey, waitUntilCondition } from "./utils.js";
 import { chat_completion_sources, oai_settings } from "./openai.js";
 import { getTokenCount } from "./tokenizers.js";
 
@@ -210,10 +210,12 @@ $("#character_popup").on("input", function () { countTokensDebounced(); });
 //function:
 export function RA_CountCharTokens() {
     let total_tokens = 0;
+    let permanent_tokens = 0;
 
     $('[data-token-counter]').each(function () {
         const counter = $(this);
         const input = $(document.getElementById(counter.data('token-counter')));
+        const isPermanent = counter.data('token-permanent') === true;
         const value = String(input.val());
 
         if (input.length === 0) {
@@ -230,10 +232,12 @@ export function RA_CountCharTokens() {
 
         if (input.data('last-value-hash') === valueHash) {
             total_tokens += Number(counter.text());
+            permanent_tokens += isPermanent ? Number(counter.text()) : 0;
         } else {
             const tokens = getTokenCount(value);
             counter.text(tokens);
             total_tokens += tokens;
+            permanent_tokens += isPermanent ? tokens : 0;
             input.data('last-value-hash', valueHash);
         }
     });
@@ -242,6 +246,7 @@ export function RA_CountCharTokens() {
     const tokenLimit = Math.max(((main_api !== 'openai' ? max_context : oai_settings.openai_max_context) / 2), 1024);
     const showWarning = (total_tokens > tokenLimit);
     $('#result_info_total_tokens').text(total_tokens);
+    $('#result_info_permanent_tokens').text(permanent_tokens);
     $('#result_info_text').toggleClass('neutral_warning', showWarning);
     $('#chartokenwarning').toggle(showWarning);
 }
@@ -403,15 +408,6 @@ function RA_autoconnect(PrevApi) {
     }
 }
 
-function isUrlOrAPIKey(string) {
-    try {
-        new URL(string);
-        return true;
-    } catch (_) {
-        //          return pattern.test(string);
-    }
-}
-
 function OpenNavPanels() {
     const deviceInfo = getDeviceInfo();
     if (deviceInfo && deviceInfo.device.type === 'desktop') {
@@ -450,9 +446,9 @@ export function dragElement(elmnt) {
         topbar, topbarWidth, topBarFirstX, topBarLastX, topBarLastY, sheldWidth;
 
     var elmntName = elmnt.attr('id');
-    console.log(`dragElement called for ${elmntName}`);
+    console.debug(`dragElement called for ${elmntName}`);
     const elmntNameEscaped = $.escapeSelector(elmntName);
-    console.log(`dragElement escaped name: ${elmntNameEscaped}`);
+    console.debug(`dragElement escaped name: ${elmntNameEscaped}`);
     const elmntHeader = $(`#${elmntNameEscaped}header`);
 
     if (elmntHeader.length) {
@@ -557,6 +553,12 @@ export function dragElement(elmnt) {
             //set a listener for mouseup to save new width/height
             elmnt.off('mouseup').on('mouseup', () => {
                 console.debug(`Saving ${elmntName} Height/Width`)
+                // check if the height or width actually changed
+                if (power_user.movingUIState[elmntName].width === width && power_user.movingUIState[elmntName].height === height) {
+                    console.debug('no change detected, aborting save')
+                    return
+                }
+
                 power_user.movingUIState[elmntName].width = width;
                 power_user.movingUIState[elmntName].height = height;
                 eventSource.emit('resizeUI', elmntName);
@@ -861,8 +863,12 @@ export function initRossMods() {
 
     //this makes the chat input text area resize vertically to match the text size (limited by CSS at 50% window height)
     $('#send_textarea').on('input', function () {
+        const chatBlock = $('#chat');
+        const originalScrollBottom = chatBlock[0].scrollHeight - (chatBlock.scrollTop() + chatBlock.outerHeight());
         this.style.height = window.getComputedStyle(this).getPropertyValue('min-height');
         this.style.height = (this.scrollHeight) + 'px';
+        const newScrollTop = chatBlock[0].scrollHeight - (chatBlock.outerHeight() + originalScrollBottom);
+        chatBlock.scrollTop(newScrollTop);
     });
 
     //Regenerate if user swipes on the last mesage in chat
@@ -900,10 +906,13 @@ export function initRossMods() {
     }
 
     $(document).on('keydown', function (event) {
-        processHotkeys(event);
+        processHotkeys(event.originalEvent);
     });
 
     //Additional hotkeys CTRL+ENTER and CTRL+UPARROW
+    /**
+     * @param {KeyboardEvent} event
+     */
     function processHotkeys(event) {
         //Enter to send when send_textarea in focus
         if ($(':focus').attr('id') === 'send_textarea') {
@@ -937,6 +946,14 @@ export function initRossMods() {
             }, 300);
         }
 
+        // Alt+Enter or AltGr+Enter to Continue
+        if ((event.altKey || (event.altKey && event.ctrlKey)) && event.key == "Enter") {
+            if (is_send_press == false) {
+                console.debug("Continuing with Alt+Enter");
+                $('#option_continue').trigger('click');
+            }
+        }
+
         // Ctrl+Enter for Regeneration Last Response. If editing, accept the edits instead
         if (event.ctrlKey && event.key == "Enter") {
             const editMesDone = $(".mes_edit_done:visible");
@@ -949,14 +966,6 @@ export function initRossMods() {
                 $('#options').hide();
             } else {
                 console.debug("Ctrl+Enter ignored");
-            }
-        }
-
-        // Alt+Enter to Continue
-        if (event.altKey && event.key == "Enter") {
-            if (is_send_press == false) {
-                console.debug("Continuing with Alt+Enter");
-                $('#option_continue').trigger('click');
             }
         }
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 // native node modules
-const child_process = require('child_process')
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require("http");
@@ -14,7 +13,6 @@ const { finished } = require('stream/promises');
 const { TextEncoder, TextDecoder } = require('util');
 
 // cli/fs related library imports
-const commandExistsSync = require('command-exists').sync;
 const open = require('open');
 const sanitize = require('sanitize-filename');
 const simpleGit = require('simple-git');
@@ -32,7 +30,8 @@ const multer = require("multer");
 const responseTime = require('response-time');
 
 // net related library imports
-const axios = require('axios');
+const net = require("net");
+const dns = require('dns');
 const DeviceDetector = require("device-detector-js");
 const fetch = require('node-fetch').default;
 const ipaddr = require('ipaddr.js');
@@ -57,18 +56,22 @@ const { Tokenizer } = require('@agnai/web-tokenizers');
 
 // misc/other imports
 const _ = require('lodash');
-const { generateRequestUrl, normaliseResponse } = require('google-translate-api-browser');
+
+// Unrestrict console logs display limit
+util.inspect.defaultOptions.maxArrayLength = null;
+util.inspect.defaultOptions.maxStringLength = null;
 
 // Create files before running anything else
 createDefaultFiles();
 
 // local library imports
-const AIHorde = require("./src/horde");
 const basicAuthMiddleware = require('./src/middleware/basicAuthMiddleware');
 const characterCardParser = require('./src/character-card-parser.js');
 const contentManager = require('./src/content-manager');
 const novelai = require('./src/novelai');
 const statsHelpers = require('./statsHelpers.js');
+const { writeSecret, readSecret, readSecretState, migrateSecrets, SECRET_KEYS, getAllSecrets } = require('./src/secrets');
+const { delay, getVersion } = require('./src/util');
 
 function createDefaultFiles() {
     const files = {
@@ -90,9 +93,16 @@ function createDefaultFiles() {
     }
 }
 
-const net = require("net");
-// @ts-ignore work around a node v20 bug: https://github.com/nodejs/node/issues/47822#issuecomment-1564708870
-if (net.setDefaultAutoSelectFamily) net.setDefaultAutoSelectFamily(false);
+// Work around a node v20.0.0, v20.1.0, and v20.2.0 bug. The issue was fixed in v20.3.0.
+// https://github.com/nodejs/node/issues/47822#issuecomment-1564708870
+// Safe to remove once support for Node v20 is dropped.
+if (process.versions && process.versions.node && process.versions.node.match(/20\.[0-2]\.0/)) {
+    // @ts-ignore
+    if (net.setDefaultAutoSelectFamily) net.setDefaultAutoSelectFamily(false);
+}
+
+// Set default DNS resolution order to IPv4 first
+dns.setDefaultResultOrder('ipv4first');
 
 const cliArguments = yargs(hideBin(process.argv))
     .option('disableCsrf', {
@@ -146,13 +156,6 @@ const enableExtensions = config.enableExtensions;
 const listen = config.listen;
 const allowKeysExposure = config.allowKeysExposure;
 
-function getHordeClient() {
-    const ai_horde = new AIHorde({
-        client_agent: getVersion()?.agent || 'SillyTavern:UNKNOWN:Cohee#1207',
-    });
-    return ai_horde;
-}
-
 const API_NOVELAI = "https://api.novelai.net";
 const API_OPENAI = "https://api.openai.com/v1";
 const API_CLAUDE = "https://api.anthropic.com/v1";
@@ -185,7 +188,14 @@ function get_mancer_headers() {
     return api_key_mancer ? { "X-API-KEY": api_key_mancer } : {};
 }
 
-
+function getOverrideHeaders(urlHost) {
+    const overrideHeaders = config.requestOverrides?.find((e) => e.hosts?.includes(urlHost))?.headers;
+    if (overrideHeaders && urlHost) {
+        return overrideHeaders;
+    } else {
+        return {};
+    }
+}
 
 //RossAscends: Added function to format dates used in files and chat timestamps to a humanized format.
 //Mostly I wanted this to be for file names, but couldn't figure out exactly where the filename save code was as everything seemed to be connected.
@@ -193,8 +203,6 @@ function get_mancer_headers() {
 //It also does not break old characters/chats, as the code just uses whatever timestamp exists in the chat.
 //New chats made with characters will use this new formatting.
 //Useable variable is (( humanizedISO8601Datetime ))
-
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const CHARS_PER_TOKEN = 3.35;
 
@@ -293,8 +301,8 @@ function getTiktokenTokenizer(model) {
     return tokenizer;
 }
 
-function humanizedISO8601DateTime() {
-    let baseDate = new Date(Date.now());
+function humanizedISO8601DateTime(date) {
+    let baseDate = typeof date === 'number' ? new Date(date) : new Date();
     let humanYear = baseDate.getFullYear();
     let humanMonth = (baseDate.getMonth() + 1);
     let humanDate = baseDate.getDate();
@@ -309,6 +317,7 @@ function humanizedISO8601DateTime() {
 var charactersPath = 'public/characters/';
 var chatsPath = 'public/chats/';
 const UPLOADS_PATH = './uploads';
+const SETTINGS_FILE = './public/settings.json';
 const AVATAR_WIDTH = 400;
 const AVATAR_HEIGHT = 600;
 const jsonParser = express.json({ limit: '100mb' });
@@ -540,21 +549,23 @@ app.post("/generate", jsonParser, async function (request, response_generate) {
     console.log(this_settings);
     const args = {
         body: JSON.stringify(this_settings),
-        headers: { "Content-Type": "application/json" },
+        headers: Object.assign(
+            { "Content-Type": "application/json" },
+            getOverrideHeaders((new URL(api_server))?.host)
+        ),
         signal: controller.signal,
     };
 
     const MAX_RETRIES = 50;
     const delayAmount = 2500;
-    let url, response;
     for (let i = 0; i < MAX_RETRIES; i++) {
         try {
-            url = request.body.streaming ? `${api_server}/extra/generate/stream` : `${api_server}/v1/generate`;
-            response = await fetch(url, { method: 'POST', timeout: 0, ...args });
+            const url = request.body.streaming ? `${api_server}/extra/generate/stream` : `${api_server}/v1/generate`;
+            const response = await fetch(url, { method: 'POST', timeout: 0, ...args });
 
             if (request.body.streaming) {
                 request.socket.on('close', function () {
-                    response.body.destroy(); // Close the remote stream
+                    if (response.body instanceof Readable) response.body.destroy(); // Close the remote stream
                     response_generate.end(); // End the Express response
                 });
 
@@ -621,7 +632,7 @@ app.post("/generate_textgenerationwebui", jsonParser, async function (request, r
     if (request.header('X-Response-Streaming')) {
         const streamingUrlHeader = request.header('X-Streaming-URL');
         if (streamingUrlHeader === undefined) return response_generate.sendStatus(400);
-        const streamingUrl = streamingUrlHeader.replace("localhost", "127.0.0.1");
+        const streamingUrlString = streamingUrlHeader.replace("localhost", "127.0.0.1");
 
         response_generate.writeHead(200, {
             'Content-Type': 'text/plain;charset=utf-8',
@@ -630,11 +641,18 @@ app.post("/generate_textgenerationwebui", jsonParser, async function (request, r
         });
 
         async function* readWebsocket() {
+            const streamingUrl = new URL(streamingUrlString);
             const websocket = new WebSocket(streamingUrl);
 
             websocket.on('open', async function () {
                 console.log('WebSocket opened');
-                const combined_args = Object.assign(request.body.use_mancer ? get_mancer_headers() : {}, request.body);
+                const combined_args = Object.assign(
+                    {},
+                    request.body.use_mancer ? get_mancer_headers() : getOverrideHeaders(streamingUrl?.host),
+                    request.body
+                );
+                console.log(combined_args);
+
                 websocket.send(JSON.stringify(combined_args));
             });
 
@@ -716,6 +734,8 @@ app.post("/generate_textgenerationwebui", jsonParser, async function (request, r
 
         if (request.body.use_mancer) {
             args.headers = Object.assign(args.headers, get_mancer_headers());
+        } else {
+            args.headers = Object.assign(args.headers, getOverrideHeaders((new URL(api_server))?.host));
         }
 
         try {
@@ -783,6 +803,32 @@ app.post("/getchat", jsonParser, function (request, response) {
     }
 });
 
+app.post("/api/mancer/models", jsonParser, async function (_req, res) {
+    try {
+        const response = await fetch('https://mancer.tech/internal/api/models');
+        const data = await response.json();
+
+        if (!response.ok) {
+            console.log('Mancer models endpoint is offline.');
+            return res.json([]);
+        }
+
+        if (!Array.isArray(data.models)) {
+            console.log('Mancer models response is not an array.')
+            return res.json([]);
+        }
+
+        const modelIds = data.models.map(x => x.id);
+        console.log('Mancer models available:', modelIds);
+
+        return res.json(data.models);
+    } catch (error) {
+        console.error(error);
+        return res.json([]);
+    }
+});
+
+// Only called for kobold and ooba/mancer
 app.post("/getstatus", jsonParser, async function (request, response) {
     if (!request.body) return response.sendStatus(400);
     api_server = request.body.api_server;
@@ -797,6 +843,8 @@ app.post("/getstatus", jsonParser, async function (request, response) {
 
     if (main_api == 'textgenerationwebui' && request.body.use_mancer) {
         args.headers = Object.assign(args.headers, get_mancer_headers());
+    } else {
+        args.headers = Object.assign(args.headers, getOverrideHeaders((new URL(api_server))?.host));
     }
 
     const url = api_server + "/v1/model";
@@ -842,30 +890,6 @@ app.post("/getstatus", jsonParser, async function (request, response) {
     }
 });
 
-function getVersion() {
-    let pkgVersion = 'UNKNOWN';
-    let gitRevision = null;
-    let gitBranch = null;
-    try {
-        const pkgJson = require('./package.json');
-        pkgVersion = pkgJson.version;
-        if (!process['pkg'] && commandExistsSync('git')) {
-            gitRevision = child_process
-                .execSync('git rev-parse --short HEAD', { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] })
-                .toString().trim();
-
-            gitBranch = child_process
-                .execSync('git rev-parse --abbrev-ref HEAD', { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] })
-                .toString().trim();
-        }
-    }
-    catch {
-        // suppress exception
-    }
-
-    const agent = `SillyTavern:${pkgVersion}:Cohee#1207`;
-    return { agent, pkgVersion, gitRevision, gitBranch };
-}
 
 function tryParse(str) {
     try {
@@ -893,7 +917,7 @@ function convertToV2(char) {
     });
 
     result.chat = char.chat ?? humanizedISO8601DateTime();
-    result.create_date = char.create_date;
+    result.create_date = char.create_date ?? humanizedISO8601DateTime();
     return result;
 }
 
@@ -951,7 +975,6 @@ function readFromV2(char) {
     });
 
     char['chat'] = char['chat'] ?? humanizedISO8601DateTime();
-    char['create_date'] = char['create_date'] || humanizedISO8601DateTime();
 
     return char;
 }
@@ -982,7 +1005,6 @@ function charaFormatData(data) {
     _.set(char, 'chat', data.ch_name + ' - ' + humanizedISO8601DateTime());
     _.set(char, 'talkativeness', data.talkativeness);
     _.set(char, 'fav', data.fav == 'true');
-    _.set(char, 'create_date', humanizedISO8601DateTime());
 
     // Spec V2 fields
     _.set(char, 'spec', 'chara_card_v2');
@@ -1287,6 +1309,9 @@ async function tryReadImage(img_url, crop) {
             if (crop.want_resize) {
                 final_width = AVATAR_WIDTH
                 final_height = AVATAR_HEIGHT
+            } else {
+                final_width = crop.width;
+                final_height = crop.height;
             }
         }
 
@@ -1350,6 +1375,7 @@ const processCharacter = async (item, i) => {
         characters[i]['json_data'] = img_data;
         const charStat = fs.statSync(path.join(charactersPath, item));
         characters[i]['date_added'] = charStat.birthtimeMs;
+        characters[i]['create_date'] = jsonObject['create_date'] || humanizedISO8601DateTime(charStat.birthtimeMs);
         const char_dir = path.join(chatsPath, item.replace('.png', ''));
 
         const { chatSize, dateLastChat } = calculateChatSize(char_dir);
@@ -1785,7 +1811,12 @@ app.post('/savequickreply', jsonParser, (request, response) => {
     return response.sendStatus(200);
 });
 
+/**
+ * @param {string} name Name of World Info file
+ * @param {object} entries Entries object
+ */
 function convertWorldInfoToCharacterBook(name, entries) {
+    /** @type {{ entries: object[]; name: string }} */
     const result = { entries: [], name };
 
     for (const index in entries) {
@@ -1967,7 +1998,7 @@ app.post("/generate_novelai", jsonParser, async function (request, response_gene
             response.body.pipe(response_generate_novel);
 
             request.socket.on('close', function () {
-                response.body.destroy(); // Close the remote stream
+                if (response.body instanceof Readable) response.body.destroy(); // Close the remote stream
                 response_generate_novel.end(); // End the Express response
             });
 
@@ -2112,6 +2143,7 @@ app.post("/importcharacter", urlencodedParser, async function (request, response
                     importRisuSprites(jsonData);
                     unsetFavFlag(jsonData);
                     jsonData = readFromV2(jsonData);
+                    jsonData["create_date"] = humanizedISO8601DateTime();
                     png_name = getPngName(jsonData.data?.name || jsonData.name);
                     let char = JSON.stringify(jsonData);
                     charaWrite(defaultAvatarPath, char, png_name, response, { file_name: png_name });
@@ -2198,7 +2230,8 @@ app.post("/importcharacter", urlencodedParser, async function (request, response
                     importRisuSprites(jsonData);
                     unsetFavFlag(jsonData);
                     jsonData = readFromV2(jsonData);
-                    let char = JSON.stringify(jsonData);
+                    jsonData["create_date"] = humanizedISO8601DateTime();
+                    const char = JSON.stringify(jsonData);
                     await charaWrite(uploadPath, char, png_name, response, { file_name: png_name });
                     fs.unlinkSync(uploadPath);
                 } else if (jsonData.name !== undefined) {
@@ -2224,8 +2257,8 @@ app.post("/importcharacter", urlencodedParser, async function (request, response
                         "tags": jsonData.tags ?? '',
                     };
                     char = convertToV2(char);
-                    char = JSON.stringify(char);
-                    await charaWrite(uploadPath, char, png_name, response, { file_name: png_name });
+                    const charJSON = JSON.stringify(char);
+                    await charaWrite(uploadPath, charJSON, png_name, response, { file_name: png_name });
                     fs.unlinkSync(uploadPath);
                 } else {
                     console.log('Unknown character card format');
@@ -2254,17 +2287,31 @@ app.post("/dupecharacter", jsonParser, async function (request, response) {
         }
         let suffix = 1;
         let newFilename = filename;
+
+        // If filename ends with a _number, increment the number
+        const nameParts = path.basename(filename, path.extname(filename)).split('_');
+        const lastPart = nameParts[nameParts.length - 1];
+
+        let baseName;
+
+        if (!isNaN(Number(lastPart)) && nameParts.length > 1) {
+            suffix = parseInt(lastPart) + 1;
+            baseName = nameParts.slice(0, -1).join("_"); // construct baseName without suffix
+        } else {
+            baseName = nameParts.join("_"); // original filename is completely the baseName
+        }
+
+        newFilename = path.join(directories.characters, `${baseName}_${suffix}${path.extname(filename)}`);
+
         while (fs.existsSync(newFilename)) {
             let suffixStr = "_" + suffix;
-            let ext = path.extname(filename);
-            newFilename = filename.slice(0, -ext.length) + suffixStr + ext;
+            newFilename = path.join(directories.characters, `${baseName}${suffixStr}${path.extname(filename)}`);
             suffix++;
         }
-        fs.copyFile(filename, newFilename, (err) => {
-            if (err) throw err;
-            console.log(`${filename} was copied to ${newFilename}`);
-            response.sendStatus(200);
-        });
+
+        fs.copyFileSync(filename, newFilename);
+        console.log(`${filename} was copied to ${newFilename}`);
+        response.sendStatus(200);
     }
     catch (error) {
         console.error(error);
@@ -2357,6 +2404,7 @@ app.post("/exportcharacter", jsonParser, async function (request, response) {
         case 'json': {
             try {
                 let json = await charaRead(filename);
+                if (json === false || json === undefined) return response.sendStatus(400);
                 let jsonObject = getCharaCardV2(json5.parse(json));
                 return response.type('json').send(jsonObject)
             }
@@ -2367,6 +2415,7 @@ app.post("/exportcharacter", jsonParser, async function (request, response) {
         case 'webp': {
             try {
                 let json = await charaRead(filename);
+                if (json === false || json === undefined) return response.sendStatus(400);
                 let stringByteArray = utf8Encode.encode(json).toString();
                 let inputWebpPath = path.join(UPLOADS_PATH, `${Date.now()}_input.webp`);
                 let outputWebpPath = path.join(UPLOADS_PATH, `${Date.now()}_output.webp`);
@@ -2404,6 +2453,11 @@ app.post("/exportcharacter", jsonParser, async function (request, response) {
 app.post("/importgroupchat", urlencodedParser, function (request, response) {
     try {
         const filedata = request.file;
+
+        if (!filedata) {
+            return response.sendStatus(400);
+        }
+
         const chatname = humanizedISO8601DateTime();
         const pathToUpload = path.join(UPLOADS_PATH, filedata.filename);
         const pathToNewFile = path.join(directories.groupChats, `${chatname}.jsonl`);
@@ -2425,128 +2479,118 @@ app.post("/importchat", urlencodedParser, function (request, response) {
     let ch_name = request.body.character_name;
     let user_name = request.body.user_name || 'You';
 
-    if (filedata) {
+    if (!filedata) {
+        return response.sendStatus(400);
+    }
+
+    try {
+        const data = fs.readFileSync(path.join(UPLOADS_PATH, filedata.filename), 'utf8');
+
         if (format === 'json') {
-            fs.readFile(path.join(UPLOADS_PATH, filedata.filename), 'utf8', (err, data) => {
-
-                if (err) {
-                    console.log(err);
-                    response.send({ error: true });
+            const jsonData = json5.parse(data);
+            if (jsonData.histories !== undefined) {
+                //console.log('/importchat confirms JSON histories are defined');
+                const chat = {
+                    from(history) {
+                        return [
+                            {
+                                user_name: user_name,
+                                character_name: ch_name,
+                                create_date: humanizedISO8601DateTime(),
+                            },
+                            ...history.msgs.map(
+                                (message) => ({
+                                    name: message.src.is_human ? user_name : ch_name,
+                                    is_user: message.src.is_human,
+                                    is_name: true,
+                                    send_date: humanizedISO8601DateTime(),
+                                    mes: message.text,
+                                })
+                            )];
+                    }
                 }
 
-                const jsonData = json5.parse(data);
-                if (jsonData.histories !== undefined) {
-                    //console.log('/importchat confirms JSON histories are defined');
-                    const chat = {
-                        from(history) {
-                            return [
-                                {
-                                    user_name: user_name,
-                                    character_name: ch_name,
-                                    create_date: humanizedISO8601DateTime(),
-                                },
-                                ...history.msgs.map(
-                                    (message) => ({
-                                        name: message.src.is_human ? user_name : ch_name,
-                                        is_user: message.src.is_human,
-                                        is_name: true,
-                                        send_date: humanizedISO8601DateTime(),
-                                        mes: message.text,
-                                    })
-                                )];
-                        }
+                const newChats = [];
+                (jsonData.histories.histories ?? []).forEach((history) => {
+                    newChats.push(chat.from(history));
+                });
+
+                const errors = [];
+
+                for (const chat of newChats) {
+                    const filePath = `${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()} imported.jsonl`;
+                    const fileContent = chat.map(tryParse).filter(x => x).join('\n');
+
+                    try {
+                        writeFileAtomicSync(filePath, fileContent, 'utf8');
+                    } catch (err) {
+                        errors.push(err);
                     }
-
-                    const newChats = [];
-                    (jsonData.histories.histories ?? []).forEach((history) => {
-                        newChats.push(chat.from(history));
-                    });
-
-                    const errors = [];
-
-                    for (const chat of newChats) {
-                        const filePath = `${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()} imported.jsonl`;
-                        const fileContent = chat.map(tryParse).filter(x => x).join('\n');
-
-                        try {
-                            writeFileAtomicSync(filePath, fileContent, 'utf8');
-                        } catch (err) {
-                            errors.push(err);
-                        }
-                    }
-
-                    if (0 < errors.length) {
-                        response.send('Errors occurred while writing character files. Errors: ' + JSON.stringify(errors));
-                    }
-
-                    response.send({ res: true });
-                } else if (Array.isArray(jsonData.data_visible)) {
-                    // oobabooga's format
-                    const chat = [{
-                        user_name: user_name,
-                        character_name: ch_name,
-                        create_date: humanizedISO8601DateTime(),
-                    }];
-
-                    for (const arr of jsonData.data_visible) {
-                        if (arr[0]) {
-                            const userMessage = {
-                                name: user_name,
-                                is_user: true,
-                                is_name: true,
-                                send_date: humanizedISO8601DateTime(),
-                                mes: arr[0],
-                            };
-                            chat.push(userMessage);
-                        }
-                        if (arr[1]) {
-                            const charMessage = {
-                                name: ch_name,
-                                is_user: false,
-                                is_name: true,
-                                send_date: humanizedISO8601DateTime(),
-                                mes: arr[1],
-                            };
-                            chat.push(charMessage);
-                        }
-                    }
-
-                    writeFileAtomicSync(`${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()} imported.jsonl`, chat.map(JSON.stringify).join('\n'), 'utf8');
-
-                    response.send({ res: true });
-                } else {
-                    response.send({ error: true });
                 }
-            });
+
+                if (0 < errors.length) {
+                    response.send('Errors occurred while writing character files. Errors: ' + JSON.stringify(errors));
+                }
+
+                response.send({ res: true });
+            } else if (Array.isArray(jsonData.data_visible)) {
+                // oobabooga's format
+                /** @type {object[]} */
+                const chat = [{
+                    user_name: user_name,
+                    character_name: ch_name,
+                    create_date: humanizedISO8601DateTime(),
+                }];
+
+                for (const arr of jsonData.data_visible) {
+                    if (arr[0]) {
+                        const userMessage = {
+                            name: user_name,
+                            is_user: true,
+                            is_name: true,
+                            send_date: humanizedISO8601DateTime(),
+                            mes: arr[0],
+                        };
+                        chat.push(userMessage);
+                    }
+                    if (arr[1]) {
+                        const charMessage = {
+                            name: ch_name,
+                            is_user: false,
+                            is_name: true,
+                            send_date: humanizedISO8601DateTime(),
+                            mes: arr[1],
+                        };
+                        chat.push(charMessage);
+                    }
+                }
+
+                const chatContent = chat.map(obj => JSON.stringify(obj)).join('\n');
+                writeFileAtomicSync(`${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()} imported.jsonl`, chatContent, 'utf8');
+
+                response.send({ res: true });
+            } else {
+                console.log('Incorrect chat format .json');
+                return response.send({ error: true });
+            }
         }
+
         if (format === 'jsonl') {
-            //console.log(humanizedISO8601DateTime()+':imported chat format is JSONL');
-            const fileStream = fs.createReadStream(path.join(UPLOADS_PATH, filedata.filename));
-            const rl = readline.createInterface({
-                input: fileStream,
-                crlfDelay: Infinity
-            });
+            const line = data.split('\n')[0];
 
-            rl.once('line', (line) => {
-                let jsonData = json5.parse(line);
+            let jsonData = json5.parse(line);
 
-                if (jsonData.user_name !== undefined || jsonData.name !== undefined) {
-                    fs.copyFile(path.join(UPLOADS_PATH, filedata.filename), (`${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()}.jsonl`), (err) => {
-                        if (err) {
-                            response.send({ error: true });
-                            return console.log(err);
-                        } else {
-                            response.send({ res: true });
-                            return;
-                        }
-                    });
-                } else {
-                    response.send({ error: true });
-                    return;
-                }
-                rl.close();
-            });
+            if (jsonData.user_name !== undefined || jsonData.name !== undefined) {
+                fs.copyFileSync(path.join(UPLOADS_PATH, filedata.filename), (`${chatsPath + avatar_url}/${ch_name} - ${humanizedISO8601DateTime()}.jsonl`));
+                response.send({ res: true });
+            } else {
+                console.log('Incorrect chat format .jsonl');
+                return response.send({ error: true });
+            }
         }
+    } catch (error) {
+        console.error(error);
+        return response.send({ error: true });
     }
 });
 
@@ -2734,6 +2778,7 @@ app.post('/getgroups', jsonParser, (_, response) => {
             const group = json5.parse(fileContents);
             const groupStat = fs.statSync(filePath);
             group['date_added'] = groupStat.birthtimeMs;
+            group['create_date'] = humanizedISO8601DateTime(groupStat.birthtimeMs);
 
             let chat_size = 0;
             let date_last_chat = 0;
@@ -2815,7 +2860,7 @@ app.post('/getgroupchat', jsonParser, (request, response) => {
         const lines = data.split('\n');
 
         // Iterate through the array of strings and parse each line as JSON
-        const jsonData = lines.map(json5.parse);
+        const jsonData = lines.map(line => tryParse(line)).filter(x => x);
         return response.send(jsonData);
     } else {
         return response.send([]);
@@ -2920,7 +2965,7 @@ app.get('/discover_extensions', jsonParser, function (_, response) {
 });
 
 app.get('/get_sprites', jsonParser, function (request, response) {
-    const name = request.query.name;
+    const name = String(request.query.name);
     const spritesPath = path.join(directories.characters, name);
     let sprites = [];
 
@@ -3070,7 +3115,7 @@ async function generateThumbnail(type, file) {
 
         try {
             const image = await jimp.read(pathToOriginalFile);
-            buffer = await image.cover(mySize[0], mySize[1]).quality(95).getBufferAsync(mime.lookup('jpg'));
+            buffer = await image.cover(mySize[0], mySize[1]).quality(95).getBufferAsync('image/jpeg');
         }
         catch (inner) {
             console.warn(`Thumbnailer can not process the image: ${pathToOriginalFile}. Using original size`);
@@ -3106,7 +3151,7 @@ app.get('/thumbnail', jsonParser, async function (request, response) {
     }
 
     if (config.disableThumbnails == true) {
-        let folder = getOriginalFolder(file)
+        let folder = getOriginalFolder(type);
         if (folder === undefined) return response.sendStatus(400);
         const pathToOriginalFile = path.join(folder, file);
         return response.sendFile(pathToOriginalFile, { root: process.cwd() });
@@ -3557,15 +3602,15 @@ app.post("/generate_openai", jsonParser, function (request, response_generate_op
         controller.abort();
     });
 
+    /** @type {import('node-fetch').RequestInit} */
     const config = {
         method: 'post',
-        url: endpointUrl,
         headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + api_key_openai,
             ...headers,
         },
-        data: {
+        body: JSON.stringify({
             "messages": isTextCompletion === false ? request.body.messages : undefined,
             "prompt": isTextCompletion === true ? textPrompt : undefined,
             "model": request.body.model,
@@ -3579,75 +3624,62 @@ app.post("/generate_openai", jsonParser, function (request, response_generate_op
             "stop": request.body.stop,
             "logit_bias": request.body.logit_bias,
             ...bodyParams,
-        },
+        }),
         signal: controller.signal,
+        timeout: 0,
     };
 
-    console.log(config.data);
+    console.log(JSON.parse(String(config.body)));
 
-    if (request.body.stream) {
-        config.responseType = 'stream';
-    }
+    makeRequest(config, response_generate_openai, request);
 
+    /**
+     *
+     * @param {*} config
+     * @param {express.Response} response_generate_openai
+     * @param {express.Request} request
+     * @param {Number} retries
+     * @param {Number} timeout
+     */
     async function makeRequest(config, response_generate_openai, request, retries = 5, timeout = 5000) {
         try {
-            // @ts-ignore - axios typings are wrong, this is actually callable https://github.com/axios/axios/issues/5213
-            const response = await axios(config);
+            const fetchResponse = await fetch(endpointUrl, config)
 
-            if (response.status <= 299) {
+            if (fetchResponse.ok) {
                 if (request.body.stream) {
                     console.log('Streaming request in progress');
-                    response.data.pipe(response_generate_openai);
-                    response.data.on('end', () => {
+                    fetchResponse.body.pipe(response_generate_openai);
+                    fetchResponse.body.on('end', () => {
                         console.log('Streaming request finished');
                         response_generate_openai.end();
                     });
                 } else {
-                    response_generate_openai.send(response.data);
-                    console.log(response.data);
-                    console.log(response.data?.choices[0]?.message);
+                    let json = await fetchResponse.json()
+                    response_generate_openai.send(json);
+                    console.log(json);
+                    console.log(json?.choices[0]?.message);
                 }
-            } else {
-                handleErrorResponse(response, response_generate_openai, request);
-            }
-        } catch (error) {
-            if (error.response && error.response.status === 429 && retries > 0) {
+            } else if (fetchResponse.status === 429 && retries > 0) {
                 console.log(`Out of quota, retrying in ${Math.round(timeout / 1000)}s`);
                 setTimeout(() => {
                     makeRequest(config, response_generate_openai, request, retries - 1);
                 }, timeout);
             } else {
-                let errorData = error?.response?.data;
-
-                if (request.body.stream) {
-                    try {
-                        const chunks = await readAllChunks(errorData);
-                        const blob = new Blob(chunks, { type: 'application/json' });
-                        const text = await blob.text();
-                        errorData = JSON.parse(text);
-                    } catch {
-                        console.warn('Error parsing streaming response');
-                    }
-                } else {
-                    errorData = typeof errorData === 'string' ? tryParse(errorData) : errorData;
-                }
-
-                handleError(error, response_generate_openai, errorData);
+                await handleErrorResponse(fetchResponse);
+            }
+        } catch (error) {
+            console.log('Generation failed', error);
+            if (!response_generate_openai.headersSent) {
+                response_generate_openai.send({ error: true });
+            } else {
+                response_generate_openai.end();
             }
         }
     }
 
-    function handleErrorResponse(response, response_generate_openai, request) {
-        if (response.status >= 400 && response.status <= 504) {
-            console.log('Error occurred:', response.status, response.data);
-            response_generate_openai.send({ error: true });
-        }
-    }
-
-    function handleError(error, response_generate_openai, errorData) {
-        console.error('Error:', error?.message);
-
-        let message = error?.response?.statusText;
+    async function handleErrorResponse(response) {
+        const responseText = await response.text();
+        const errorData = tryParse(responseText);
 
         const statusMessages = {
             400: 'Bad request',
@@ -3657,24 +3689,21 @@ app.post("/generate_openai", jsonParser, function (request, response_generate_op
             404: 'Not found',
             429: 'Too many requests',
             451: 'Unavailable for legal reasons',
+            502: 'Bad gateway',
         };
 
-        const status = error?.response?.status;
-        if (statusMessages.hasOwnProperty(status)) {
-            message = errorData?.error?.message || statusMessages[status];
-            console.log(message);
-        }
+        const message = errorData?.error?.message || statusMessages[response.status] || 'Unknown error occurred';
+        const quota_error = response.status === 429 && errorData?.error?.type === 'insufficient_quota';
+        console.log(message);
 
-        const quota_error = error?.response?.status === 429 && errorData?.error?.type === 'insufficient_quota';
-        const response = { error: { message }, quota_error: quota_error }
         if (!response_generate_openai.headersSent) {
-            response_generate_openai.send(response);
+            response_generate_openai.send({ error: { message }, quota_error: quota_error });
         } else if (!response_generate_openai.writableEnded) {
             response_generate_openai.write(response);
+        } else {
+            response_generate_openai.end();
         }
     }
-
-    makeRequest(config, response_generate_openai, request);
 });
 
 app.post("/tokenize_openai", jsonParser, function (request, response_tokenize_openai) {
@@ -3785,7 +3814,7 @@ async function sendAI21Request(request, response) {
 
 }
 
-app.post("/tokenize_ai21", jsonParser, function (request, response_tokenize_ai21) {
+app.post("/tokenize_ai21", jsonParser, async function (request, response_tokenize_ai21) {
     if (!request.body) return response_tokenize_ai21.sendStatus(400);
     const options = {
         method: 'POST',
@@ -3797,10 +3826,14 @@ app.post("/tokenize_ai21", jsonParser, function (request, response_tokenize_ai21
         body: JSON.stringify({ text: request.body[0].content })
     };
 
-    fetch('https://api.ai21.com/studio/v1/tokenize', options)
-        .then(response => response.json())
-        .then(response => response_tokenize_ai21.send({ "token_count": response.tokens.length }))
-        .catch(err => console.error(err));
+    try {
+        const response = await fetch('https://api.ai21.com/studio/v1/tokenize', options);
+        const data = await response.json();
+        return response_tokenize_ai21.send({ "token_count": data?.tokens?.length || 0 });
+    } catch (err) {
+        console.error(err);
+        return response_tokenize_ai21.send({ "token_count": 0 });
+    }
 });
 
 app.post("/save_preset", jsonParser, function (request, response) {
@@ -3966,8 +3999,10 @@ app.post("/tokenize_via_api", jsonParser, async function (request, response) {
             headers: { "Content-Type": "application/json" }
         };
 
-        if (main_api == 'textgenerationwebui' && request.body.use_mancer) {
-            args.headers = Object.assign(args.headers, get_mancer_headers());
+        if (main_api == 'textgenerationwebui') {
+            if (request.body.use_mancer) {
+                args.headers = Object.assign(args.headers, get_mancer_headers());
+            }
             const data = await postAsync(api_server + "/v1/token-count", args);
             return response.send({ count: data['results'][0]['tokens'] });
         }
@@ -4033,7 +4068,7 @@ const setupTasks = async function () {
     console.log(`SillyTavern ${version.pkgVersion}` + (version.gitBranch ? ` '${version.gitBranch}' (${version.gitRevision})` : ''));
 
     backupSettings();
-    migrateSecrets();
+    migrateSecrets(SETTINGS_FILE);
     ensurePublicDirectoriesExist();
     await ensureThumbnailCache();
     contentManager.checkForNewContent();
@@ -4184,69 +4219,6 @@ function ensurePublicDirectoriesExist() {
     }
 }
 
-const SECRETS_FILE = './secrets.json';
-const SETTINGS_FILE = './public/settings.json';
-const SECRET_KEYS = {
-    HORDE: 'api_key_horde',
-    MANCER: 'api_key_mancer',
-    OPENAI: 'api_key_openai',
-    NOVEL: 'api_key_novel',
-    CLAUDE: 'api_key_claude',
-    DEEPL: 'deepl',
-    LIBRE: 'libre',
-    LIBRE_URL: 'libre_url',
-    OPENROUTER: 'api_key_openrouter',
-    SCALE: 'api_key_scale',
-    AI21: 'api_key_ai21',
-    SCALE_COOKIE: 'scale_cookie',
-}
-
-function migrateSecrets() {
-    if (!fs.existsSync(SETTINGS_FILE)) {
-        console.log('Settings file does not exist');
-        return;
-    }
-
-    try {
-        let modified = false;
-        const fileContents = fs.readFileSync(SETTINGS_FILE, 'utf8');
-        const settings = JSON.parse(fileContents);
-        const oaiKey = settings?.api_key_openai;
-        const hordeKey = settings?.horde_settings?.api_key;
-        const novelKey = settings?.api_key_novel;
-
-        if (typeof oaiKey === 'string') {
-            console.log('Migrating OpenAI key...');
-            writeSecret(SECRET_KEYS.OPENAI, oaiKey);
-            delete settings.api_key_openai;
-            modified = true;
-        }
-
-        if (typeof hordeKey === 'string') {
-            console.log('Migrating Horde key...');
-            writeSecret(SECRET_KEYS.HORDE, hordeKey);
-            delete settings.horde_settings.api_key;
-            modified = true;
-        }
-
-        if (typeof novelKey === 'string') {
-            console.log('Migrating Novel key...');
-            writeSecret(SECRET_KEYS.NOVEL, novelKey);
-            delete settings.api_key_novel;
-            modified = true;
-        }
-
-        if (modified) {
-            console.log('Writing updated settings.json...');
-            const settingsContent = JSON.stringify(settings);
-            writeFileAtomicSync(SETTINGS_FILE, settingsContent, "utf-8");
-        }
-    }
-    catch (error) {
-        console.error('Could not migrate secrets file. Proceed with caution.');
-    }
-}
-
 app.post('/writesecret', jsonParser, (request, response) => {
     const key = request.body.key;
     const value = request.body.value;
@@ -4256,55 +4228,13 @@ app.post('/writesecret', jsonParser, (request, response) => {
 });
 
 app.post('/readsecretstate', jsonParser, (_, response) => {
-    if (!fs.existsSync(SECRETS_FILE)) {
-        return response.send({});
-    }
 
     try {
-        const fileContents = fs.readFileSync(SECRETS_FILE, 'utf8');
-        const secrets = JSON.parse(fileContents);
-        const state = {};
-
-        for (const key of Object.values(SECRET_KEYS)) {
-            state[key] = !!secrets[key]; // convert to boolean
-        }
-
+        const state = readSecretState();
         return response.send(state);
     } catch (error) {
         console.error(error);
         return response.send({});
-    }
-});
-
-const ANONYMOUS_KEY = "0000000000";
-
-app.post('/generate_horde', jsonParser, async (request, response) => {
-    const api_key_horde = readSecret(SECRET_KEYS.HORDE) || ANONYMOUS_KEY;
-    const url = 'https://horde.koboldai.net/api/v2/generate/text/async';
-
-    const args = {
-        "body": JSON.stringify(request.body),
-        "headers": {
-            "Content-Type": "application/json",
-            "apikey": api_key_horde,
-        }
-    };
-    if (request.header('Client-Agent') !== undefined) args.headers['Client-Agent'] = request.header('Client-Agent');
-
-    console.log(args.body);
-    try {
-        const data = await postAsync(url, args);
-        return response.send(data);
-    } catch (error) {
-        console.log('Horde returned an error:', error.statusText);
-
-        if (typeof error.text === 'function') {
-            const message = await error.text();
-            console.log(message);
-            return response.send({ error: { message } });
-        } else {
-            return response.send({ error: true });
-        }
     }
 });
 
@@ -4314,14 +4244,13 @@ app.post('/viewsecrets', jsonParser, async (_, response) => {
         return response.sendStatus(403);
     }
 
-    if (!fs.existsSync(SECRETS_FILE)) {
-        console.error('secrets.json does not exist');
-        return response.sendStatus(404);
-    }
-
     try {
-        const fileContents = fs.readFileSync(SECRETS_FILE, 'utf-8');
-        const secrets = JSON.parse(fileContents);
+        const secrets = getAllSecrets();
+
+        if (!secrets) {
+            return response.sendStatus(404);
+        }
+
         return response.send(secrets);
     } catch (error) {
         console.error(error);
@@ -4329,221 +4258,92 @@ app.post('/viewsecrets', jsonParser, async (_, response) => {
     }
 });
 
-app.post('/horde_samplers', jsonParser, async (_, response) => {
-    try {
-        const ai_horde = getHordeClient();
-        const samplers = Object.values(ai_horde.ModelGenerationInputStableSamplers);
-        response.send(samplers);
-    } catch (error) {
-        console.error(error);
-        response.sendStatus(500);
-    }
-});
-
-app.post('/horde_models', jsonParser, async (_, response) => {
-    try {
-        const ai_horde = getHordeClient();
-        const models = await ai_horde.getModels();
-        response.send(models);
-    } catch (error) {
-        console.error(error);
-        response.sendStatus(500);
-    }
-});
-
-app.post('/horde_userinfo', jsonParser, async (_, response) => {
-    const api_key_horde = readSecret(SECRET_KEYS.HORDE);
-
-    if (!api_key_horde) {
-        return response.send({ anonymous: true });
-    }
-
-    try {
-        const ai_horde = getHordeClient();
-        const user = await ai_horde.findUser({ token: api_key_horde });
-        return response.send(user);
-    } catch (error) {
-        console.error(error);
-        return response.sendStatus(500);
-    }
-})
-
-app.post('/horde_generateimage', jsonParser, async (request, response) => {
-    const MAX_ATTEMPTS = 200;
-    const CHECK_INTERVAL = 3000;
-    const api_key_horde = readSecret(SECRET_KEYS.HORDE) || ANONYMOUS_KEY;
-    console.log('Stable Horde request:', request.body);
-
-    try {
-        const ai_horde = getHordeClient();
-        const generation = await ai_horde.postAsyncImageGenerate(
-            {
-                prompt: `${request.body.prompt_prefix} ${request.body.prompt} ### ${request.body.negative_prompt}`,
-                params:
-                {
-                    sampler_name: request.body.sampler,
-                    hires_fix: request.body.enable_hr,
-                    // @ts-ignore - use_gfpgan param is not in the type definition, need to update to new ai_horde @ https://github.com/ZeldaFan0225/ai_horde/blob/main/index.ts
-                    use_gfpgan: request.body.restore_faces,
-                    cfg_scale: request.body.scale,
-                    steps: request.body.steps,
-                    width: request.body.width,
-                    height: request.body.height,
-                    karras: Boolean(request.body.karras),
-                    n: 1,
-                },
-                r2: false,
-                nsfw: request.body.nfsw,
-                models: [request.body.model],
-            },
-            { token: api_key_horde });
-
-        if (!generation.id) {
-            console.error('Image generation request is not satisfyable:', generation.message || 'unknown error');
-            return response.sendStatus(400);
-        }
-
-        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            await delay(CHECK_INTERVAL);
-            const check = await ai_horde.getImageGenerationCheck(generation.id);
-            console.log(check);
-
-            if (check.done) {
-                const result = await ai_horde.getImageGenerationStatus(generation.id);
-                if (result.generations === undefined) return response.sendStatus(500);
-                return response.send(result.generations[0].img);
-            }
-
-            /*
-            if (!check.is_possible) {
-                return response.sendStatus(503);
-            }
-            */
-
-            if (check.faulted) {
-                return response.sendStatus(500);
-            }
-        }
-
-        return response.sendStatus(504);
-    } catch (error) {
-        console.error(error);
-        return response.sendStatus(500);
-    }
-});
-
-app.post('/libre_translate', jsonParser, async (request, response) => {
-    const key = readSecret(SECRET_KEYS.LIBRE);
-    const url = readSecret(SECRET_KEYS.LIBRE_URL);
-
-    const text = request.body.text;
-    const lang = request.body.lang;
-
-    if (!text || !lang) {
+app.post('/api/novelai/generate-image', jsonParser, async (request, response) => {
+    if (!request.body) {
         return response.sendStatus(400);
     }
 
-    console.log('Input text: ' + text);
-
-    try {
-        const result = await fetch(url, {
-            method: "POST",
-            body: JSON.stringify({
-                q: text,
-                source: "auto",
-                target: lang,
-                format: "text",
-                api_key: key
-            }),
-            headers: { "Content-Type": "application/json" }
-        });
-
-        if (!result.ok) {
-            return response.sendStatus(result.status);
-        }
-
-        const json = await result.json();
-        console.log('Translated text: ' + json.translatedText);
-
-        return response.send(json.translatedText);
-    } catch (error) {
-        console.log("Translation error: " + error.message);
-        return response.sendStatus(500);
-    }
-});
-
-app.post('/google_translate', jsonParser, async (request, response) => {
-    const text = request.body.text;
-    const lang = request.body.lang;
-
-    if (!text || !lang) {
-        return response.sendStatus(400);
-    }
-
-    console.log('Input text: ' + text);
-
-    const url = generateRequestUrl(text, { to: lang });
-
-    https.get(url, (resp) => {
-        let data = '';
-
-        resp.on('data', (chunk) => {
-            data += chunk;
-        });
-
-        resp.on('end', () => {
-            const result = normaliseResponse(JSON.parse(data));
-            console.log('Translated text: ' + result.text);
-            return response.send(result.text);
-        });
-    }).on("error", (err) => {
-        console.log("Translation error: " + err.message);
-        return response.sendStatus(500);
-    });
-});
-
-app.post('/deepl_translate', jsonParser, async (request, response) => {
-    const key = readSecret(SECRET_KEYS.DEEPL);
+    const key = readSecret(SECRET_KEYS.NOVEL);
 
     if (!key) {
         return response.sendStatus(401);
     }
 
-    const text = request.body.text;
-    const lang = request.body.lang;
-
-    if (!text || !lang) {
-        return response.sendStatus(400);
-    }
-
-    console.log('Input text: ' + text);
-
-    const params = new URLSearchParams();
-    params.append('text', text);
-    params.append('target_lang', lang);
-
     try {
-        const result = await fetch('https://api-free.deepl.com/v2/translate', {
+        console.log('NAI Diffusion request:', request.body);
+        const generateUrl = `${API_NOVELAI}/ai/generate-image`;
+        const generateResult = await fetch(generateUrl, {
             method: 'POST',
-            body: params,
             headers: {
-                'Accept': 'application/json',
-                'Authorization': `DeepL-Auth-Key ${key}`,
-                'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': `Bearer ${key}`,
+                'Content-Type': 'application/json',
             },
-            timeout: 0,
+            body: JSON.stringify({
+                action: 'generate',
+                input: request.body.prompt,
+                model: request.body.model ?? 'nai-diffusion',
+                parameters: {
+                    negative_prompt: request.body.negative_prompt ?? '',
+                    height: request.body.height ?? 512,
+                    width: request.body.width ?? 512,
+                    scale: request.body.scale ?? 9,
+                    seed: Math.floor(Math.random() * 9999999999),
+                    sampler: request.body.sampler ?? 'k_dpmpp_2m',
+                    steps: request.body.steps ?? 28,
+                    n_samples: 1,
+                    // NAI handholding for prompts
+                    ucPreset: 0,
+                    qualityToggle: false,
+                },
+            }),
         });
 
-        if (!result.ok) {
-            return response.sendStatus(result.status);
+        if (!generateResult.ok) {
+            console.log('NovelAI returned an error.', generateResult.statusText);
+            return response.sendStatus(500);
         }
 
-        const json = await result.json();
-        console.log('Translated text: ' + json.translations[0].text);
+        const archiveBuffer = await generateResult.arrayBuffer();
+        const imageBuffer = await extractFileFromZipBuffer(archiveBuffer, '.png');
+        const originalBase64 = imageBuffer.toString('base64');
 
-        return response.send(json.translations[0].text);
+        // No upscaling
+        if (isNaN(request.body.upscale_ratio) || request.body.upscale_ratio <= 1) {
+            return response.send(originalBase64);
+        }
+
+        try {
+            console.debug('Upscaling image...');
+            const upscaleUrl = `${API_NOVELAI}/ai/upscale`;
+            const upscaleResult = await fetch(upscaleUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${key}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    image: originalBase64,
+                    height: request.body.height,
+                    width: request.body.width,
+                    scale: request.body.upscale_ratio,
+                }),
+            });
+
+            if (!upscaleResult.ok) {
+                throw new Error('NovelAI returned an error.');
+            }
+
+            const upscaledArchiveBuffer = await upscaleResult.arrayBuffer();
+            const upscaledImageBuffer = await extractFileFromZipBuffer(upscaledArchiveBuffer, '.png');
+            const upscaledBase64 = upscaledImageBuffer.toString('base64');
+
+            return response.send(upscaledBase64);
+        } catch (error) {
+            console.warn('NovelAI generated an image, but upscaling failed. Returning original image.');
+            return response.send(originalBase64)
+        }
     } catch (error) {
-        console.log("Translation error: " + error.message);
+        console.log(error);
         return response.sendStatus(500);
     }
 });
@@ -4745,6 +4545,45 @@ app.post('/import_custom', jsonParser, async (request, response) => {
     }
 });
 
+/**
+ * Extracts a file with given extension from an ArrayBuffer containing a ZIP archive.
+ * @param {ArrayBuffer} archiveBuffer Buffer containing a ZIP archive
+ * @param {string} fileExtension File extension to look for
+ * @returns {Promise<Buffer>} Buffer containing the extracted file
+ */
+async function extractFileFromZipBuffer(archiveBuffer, fileExtension) {
+    return await new Promise((resolve, reject) => yauzl.fromBuffer(Buffer.from(archiveBuffer), { lazyEntries: true }, (err, zipfile) => {
+        if (err) {
+            reject(err);
+        }
+
+        zipfile.readEntry();
+        zipfile.on('entry', (entry) => {
+            if (entry.fileName.endsWith(fileExtension)) {
+                console.log(`Extracting ${entry.fileName}`);
+                zipfile.openReadStream(entry, (err, readStream) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        const chunks = [];
+                        readStream.on('data', (chunk) => {
+                            chunks.push(chunk);
+                        });
+
+                        readStream.on('end', () => {
+                            const buffer = Buffer.concat(chunks);
+                            resolve(buffer);
+                            zipfile.readEntry(); // Continue to the next entry
+                        });
+                    }
+                });
+            } else {
+                zipfile.readEntry();
+            }
+        });
+    }));
+}
+
 async function downloadChubLorebook(id) {
     const result = await fetch('https://api.chub.ai/api/lorebooks/download', {
         method: 'POST',
@@ -4892,27 +4731,6 @@ function importRisuSprites(data) {
     }
 }
 
-function writeSecret(key, value) {
-    if (!fs.existsSync(SECRETS_FILE)) {
-        const emptyFile = JSON.stringify({});
-        writeFileAtomicSync(SECRETS_FILE, emptyFile, "utf-8");
-    }
-
-    const fileContents = fs.readFileSync(SECRETS_FILE, 'utf-8');
-    const secrets = JSON.parse(fileContents);
-    secrets[key] = value;
-    writeFileAtomicSync(SECRETS_FILE, JSON.stringify(secrets), "utf-8");
-}
-
-function readSecret(key) {
-    if (!fs.existsSync(SECRETS_FILE)) {
-        return undefined;
-    }
-
-    const fileContents = fs.readFileSync(SECRETS_FILE, 'utf-8');
-    const secrets = JSON.parse(fileContents);
-    return secrets[key];
-}
 
 async function readAllChunks(readableStream) {
     return new Promise((resolve, reject) => {
@@ -4984,8 +4802,6 @@ async function getImageBuffers(zipFilePath) {
         });
     });
 }
-
-
 
 /**
  * This function extracts the extension information from the manifest file.
@@ -5424,4 +5240,25 @@ app.post('/get_character_assets_list', jsonParser, async (request, response) => 
         console.log(err);
         return response.sendStatus(500);
     }
+});
+
+// Stable Diffusion generation
+require('./src/stable-diffusion').registerEndpoints(app, jsonParser);
+// LLM and SD Horde generation
+require('./src/horde').registerEndpoints(app, jsonParser);
+// Vector storage DB
+require('./src/vectors').registerEndpoints(app, jsonParser);
+// Chat translation
+require('./src/translate').registerEndpoints(app, jsonParser);
+// Emotion classification
+import('./src/classify.mjs').then(module => {
+    module.default.registerEndpoints(app, jsonParser);
+}).catch(err => {
+    console.error(err);
+});
+// Image captioning
+import('./src/caption.mjs').then(module => {
+    module.default.registerEndpoints(app, jsonParser);
+}).catch(err => {
+    console.error(err);
 });
